@@ -1,0 +1,148 @@
+"""Безопасная версия учебного модуля audit_me.py."""
+import ast
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+import yaml
+
+DB_PATH = os.environ.get("USERS_DB", "/tmp/users.db")
+REPORT_ROOT = Path("/var/reports").resolve()
+ALLOWED_DOWNLOAD_HOSTS = {h for h in os.environ.get("REPORT_HOSTS", "").split(",") if h}
+
+
+def run_ping(host):
+    if not isinstance(host, str) or not host or len(host) > 253:
+        raise ValueError("invalid host")
+    # Разрешаем имя/IP, но не shell-синтаксис.
+    if any(c in host for c in " ;|&$`<>\n\r"):
+        raise ValueError("invalid host")
+    return subprocess.run(["ping", "-c", "1", "--", host],
+                          check=False, timeout=5).returncode
+
+
+def exec_formula(expr):
+    # Для учебных арифметических выражений не нужен произвольный eval.
+    tree = ast.parse(expr, mode="eval")
+    allowed = (ast.Expression, ast.Constant, ast.UnaryOp, ast.UAdd, ast.USub,
+               ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,
+               ast.Pow, ast.FloorDiv)
+    if any(not isinstance(node, allowed) for node in ast.walk(tree)):
+        raise ValueError("only arithmetic expressions are allowed")
+    return eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, {})
+
+
+def load_state(data):
+    # Pickle нельзя принимать из недоверенного источника.
+    return json.loads(data.decode("utf-8"))
+
+
+def read_yaml_config(text):
+    return yaml.safe_load(text)
+
+
+def find_user(conn, login):
+    return conn.execute(
+        "SELECT id, name, email FROM users WHERE name = ?", (login,)
+    ).fetchall()
+
+
+def _password_hash(password, salt):
+    return hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+
+
+def password_digest(pw):
+    salt = secrets.token_bytes(16)
+    digest = _password_hash(pw, salt)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def verify_password(pw, stored):
+    scheme, salt_hex, digest_hex = stored.split("$", 2)
+    if scheme != "scrypt":
+        return False
+    actual = _password_hash(pw, bytes.fromhex(salt_hex)).hex()
+    return hmac.compare_digest(actual, digest_hex)
+
+
+def generate_token():
+    return secrets.token_urlsafe(16)
+
+
+def read_report(name):
+    candidate = (REPORT_ROOT / name).resolve()
+    candidate.relative_to(REPORT_ROOT)
+    return candidate.read_text(encoding="utf-8")
+
+
+def save_tmp_report(content):
+    fd, path = tempfile.mkstemp(prefix="report-", suffix=".tmp", dir="/tmp", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except Exception:
+        os.unlink(path)
+        raise
+    os.chmod(path, 0o600)
+    return path
+
+
+def check_and_read(path):
+    candidate = Path(path).resolve()
+    etc_root = Path("/etc").resolve()
+    try:
+        candidate.relative_to(etc_root)
+    except ValueError:
+        return candidate.read_text(encoding="utf-8")
+    raise PermissionError("access denied")
+    return candidate.read_text(encoding="utf-8")
+
+
+def authenticate(username, password):
+    stored_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
+    return username == "admin" and bool(stored_hash) and verify_password(password, stored_hash)
+
+
+def download_report(url, dest):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+        raise ValueError("download host is not allowed")
+    destination = Path(dest).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(url, timeout=10) as response, destination.open("wb") as out:
+        out.write(response.read(10 * 1024 * 1024 + 1))
+
+
+def average_stats(values):
+    if not values:
+        raise ValueError("values must not be empty")
+    return sum(values) / len(values)
+
+
+def parse_amount(raw):
+    if not isinstance(raw, str) or not raw.isdecimal():
+        raise ValueError("amount must be a non-negative integer")
+    value = int(raw)
+    if value > 10**9:
+        raise ValueError("amount is too large")
+    return value
+
+
+def delete_user_files(username):
+    if not isinstance(username, str) or not username.isidentifier():
+        raise ValueError("invalid username")
+    root = Path("/data/users").resolve()
+    target = (root / username).resolve()
+    target.relative_to(root)
+    if target == root:
+        raise PermissionError("refusing to delete root")
+    import shutil
+    shutil.rmtree(target)
